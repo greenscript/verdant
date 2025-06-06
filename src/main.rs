@@ -1,7 +1,9 @@
 use clap::Parser;
 use regex::Regex;
 use std::fs;
+use std::time::SystemTime;
 use walkdir::WalkDir;
+
 
 #[derive(Parser)]
 #[command(name = "verdant")]
@@ -38,6 +40,14 @@ struct Args {
     /// Enable AI-optimized extreme compression
     #[arg(long)]
     ai_mode: bool,
+    
+    /// Sort files chronologically by modification date
+    #[arg(long, default_value = "true")]
+    chronological: bool,
+
+    /// Remove emojis to save tokens  
+    #[arg(long, default_value = "true")]  
+    no_emojis: bool,
 }
 
 struct CompressionStats {
@@ -71,13 +81,23 @@ fn main() {
         chunks_created: 0,
     };
     
-    // Read all files
-    read_all_files(&md_files, &mut all_files_content, &mut stats, args.stats);
+    // Read all files with optional chronological sorting
+    read_all_files_with_sorting(&md_files, &mut all_files_content, &mut stats, args.stats, args.chronological);
     
     // Remove duplicates if needed
     if args.level != "low" {
         println!("\n🔄 Removing duplicate content across files...");
         all_files_content = remove_duplicate_content(all_files_content, args.stats);
+    }
+    
+    // Show emoji removal stats if enabled
+    if args.no_emojis {
+        let emoji_count: usize = all_files_content.iter()
+            .map(|(_, content)| count_emojis(content))
+            .sum();
+        if emoji_count > 0 {
+            println!("🚫 Removed {} emojis (~{} tokens saved)", emoji_count, emoji_count * 2);
+        }
     }
     
     // Compress content
@@ -93,28 +113,71 @@ fn main() {
     print_final_stats(&stats, args.stats);
 }
 
+fn count_emojis(content: &str) -> usize {
+    // Quick emoji count for stats
+    let emoji_regex = regex::Regex::new(r"[\u{1F600}-\u{1F64F}]|[\u{1F300}-\u{1F5FF}]|[\u{1F680}-\u{1F6FF}]|[\u{1F1E0}-\u{1F1FF}]|[\u{2600}-\u{26FF}]|[\u{2700}-\u{27BF}]").unwrap();
+    emoji_regex.find_iter(content).count()
+}
+
+
 fn print_header(args: &Args) {
-    println!("🌱 verdant v2.0");
+    println!("🌱 verdant v2.1");
     println!("  Compressing markdown for AI consumption");
-    println!("  Target: {} | Level: {} | Chunking: {}", 
-             args.model, args.level, if args.chunk { "enabled" } else { "disabled" });
+    
+    let mut features = vec![
+        format!("Target: {}", args.model),
+        format!("Level: {}", args.level),
+        format!("Chunking: {}", if args.chunk { "enabled" } else { "disabled" }),
+    ];
+    
+    if args.chronological {
+        features.push("Chronological: enabled".to_string());
+    }
+    
+    if args.no_emojis {
+        features.push("Emoji removal: enabled".to_string());
+    }
+    
+    if args.ai_mode {
+        features.push("AI mode: enabled".to_string());
+    }
+    
+    println!("  {}", features.join(" | "));
     println!();
     println!("Input: {}", args.input);
     println!("Output: {}", if args.chunk { 
-        format!("{}_chunk_*.md", args.output) 
+        format!("{}_*.md", args.output) 
     } else { 
         format!("{}.md", args.output) 
     });
     println!();
 }
 
-fn read_all_files(
+fn read_all_files_with_sorting(
     md_files: &[walkdir::DirEntry], 
     all_files_content: &mut Vec<(String, String)>, 
     stats: &mut CompressionStats,
-    show_stats: bool
+    show_stats: bool,
+    chronological: bool
 ) {
+    // Collect files with their metadata for sorting
+    let mut files_with_time: Vec<(walkdir::DirEntry, SystemTime)> = Vec::new();
+    
     for file in md_files {
+        if let Ok(metadata) = file.metadata() {
+            let modified_time = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            files_with_time.push((file.clone(), modified_time));
+        }
+    }
+    
+    // Sort chronologically if requested
+    if chronological {
+        files_with_time.sort_by(|a, b| a.1.cmp(&b.1)); // oldest first
+        println!("📅 Files sorted chronologically (oldest → newest)");
+    }
+    
+    // Process files in order
+    for (file, _) in files_with_time {
         println!("  📄 {}", file.path().display());
         
         match fs::read_to_string(file.path()) {
@@ -134,6 +197,29 @@ fn read_all_files(
     }
 }
 
+fn remove_emojis(content: &str) -> String {
+    use regex::Regex;
+    
+    let emoji_patterns = [
+        r"[\u{1F600}-\u{1F64F}]", // Emoticons
+        r"[\u{1F300}-\u{1F5FF}]", // Misc Symbols and Pictographs
+        r"[\u{1F680}-\u{1F6FF}]", // Transport and Map
+        r"[\u{1F1E0}-\u{1F1FF}]", // Regional indicators (flags)
+        r"[\u{2600}-\u{26FF}]",   // Misc symbols
+        r"[\u{2700}-\u{27BF}]",   // Dingbats
+        r"[\u{1F900}-\u{1F9FF}]", // Supplemental Symbols and Pictographs
+        r"[\u{1FA70}-\u{1FAFF}]", // Symbols and Pictographs Extended-A
+    ];
+    
+    let mut result = content.to_string();
+    for pattern in emoji_patterns {
+        let re = Regex::new(pattern).unwrap();
+        result = re.replace_all(&result, "").to_string();
+    }
+    
+    result
+}
+
 fn compress_all_content(all_files_content: &[(String, String)], args: &Args) -> String {
     let mut combined_content = String::new();
     
@@ -142,7 +228,7 @@ fn compress_all_content(all_files_content: &[(String, String)], args: &Args) -> 
     
     for (filename, content) in all_files_content {
         combined_content.push_str(&format!("F:{}\n", filename));
-        let compressed = compress_content(content, &args.level, &args.model, args.ai_mode);
+        let compressed = compress_content(content, &args.level, &args.model, args.ai_mode, args.no_emojis);
         combined_content.push_str(&compressed);
         combined_content.push_str("\n|\n");
     }
@@ -261,8 +347,13 @@ fn write_single_file(content: &str, args: &Args, stats: &mut CompressionStats) {
     }
 }
 
-fn compress_content(content: &str, level: &str, model: &str, ai_mode: bool) -> String {
+fn compress_content(content: &str, level: &str, model: &str, ai_mode: bool, no_emojis: bool) -> String {
     let mut compressed = content.to_string();
+    
+    // Remove emojis if requested (do this early to save processing)
+    if no_emojis {
+        compressed = remove_emojis(&compressed);
+    }
     
     // Always apply basic compression
     compressed = remove_excessive_whitespace(&compressed);
