@@ -1,0 +1,9 @@
+[package]
+name = "verdant"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.0", features = ["derive"] }
+walkdir = "2.0"  # For traversing directories
+regex = "1.0" 
