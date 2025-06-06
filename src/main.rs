@@ -3,7 +3,7 @@ use regex::Regex;
 use std::fs;
 use std::time::SystemTime;
 use walkdir::WalkDir;
-
+use chrono::{DateTime, Utc};
 
 #[derive(Parser)]
 #[command(name = "verdant")]
@@ -48,6 +48,10 @@ struct Args {
     /// Remove emojis to save tokens  
     #[arg(long, default_value = "true")]  
     no_emojis: bool,
+
+    /// Output format (md, vrd, json, yaml)
+    #[arg(long, default_value = "md")]
+    format: String,
 }
 
 struct CompressionStats {
@@ -56,6 +60,24 @@ struct CompressionStats {
     original_lines: usize,
     compressed_lines: usize,
     chunks_created: usize,
+}
+
+struct VrdFile {
+    name: String,
+    modified: DateTime<Utc>,
+    size: usize,
+    lines: usize,
+    tags: Vec<String>,
+    headers: Vec<String>,
+    content: String,
+    code_blocks: Vec<String>,
+}
+
+struct VrdMetadata {
+    files_count: usize,
+    estimated_tokens: usize,
+    compression_ratio: f64,
+    generated: DateTime<Utc>,
 }
 
 fn main() {
@@ -93,7 +115,7 @@ fn main() {
     // Show emoji removal stats if enabled
     if args.no_emojis {
         let emoji_count: usize = all_files_content.iter()
-            .map(|(_, content)| count_emojis(content))
+            .map(|(_, content, _)| count_emojis(content))
             .sum();
         if emoji_count > 0 {
             println!("🚫 Removed {} emojis (~{} tokens saved)", emoji_count, emoji_count * 2);
@@ -121,12 +143,13 @@ fn count_emojis(content: &str) -> usize {
 
 
 fn print_header(args: &Args) {
-    println!("🌱 verdant v2.1");
+    println!("🌱 verdant v2.3");
     println!("  Compressing markdown for AI consumption");
     
     let mut features = vec![
         format!("Target: {}", args.model),
         format!("Level: {}", args.level),
+        format!("Format: {}", args.format.to_uppercase()),
         format!("Chunking: {}", if args.chunk { "enabled" } else { "disabled" }),
     ];
     
@@ -145,22 +168,23 @@ fn print_header(args: &Args) {
     println!("  {}", features.join(" | "));
     println!();
     println!("Input: {}", args.input);
+    
+    let extension = if args.format == "vrd" { "vrd" } else { "md" };
     println!("Output: {}", if args.chunk { 
-        format!("{}_*.md", args.output) 
+        format!("{}_*.{}", args.output, extension) 
     } else { 
-        format!("{}.md", args.output) 
+        format!("{}.{}", args.output, extension) 
     });
     println!();
 }
 
 fn read_all_files_with_sorting(
     md_files: &[walkdir::DirEntry], 
-    all_files_content: &mut Vec<(String, String)>, 
+    all_files_content: &mut Vec<(String, String, std::path::PathBuf)>, // Add PathBuf
     stats: &mut CompressionStats,
     show_stats: bool,
     chronological: bool
 ) {
-    // Collect files with their metadata for sorting
     let mut files_with_time: Vec<(walkdir::DirEntry, SystemTime)> = Vec::new();
     
     for file in md_files {
@@ -170,13 +194,11 @@ fn read_all_files_with_sorting(
         }
     }
     
-    // Sort chronologically if requested
     if chronological {
-        files_with_time.sort_by(|a, b| a.1.cmp(&b.1)); // oldest first
+        files_with_time.sort_by(|a, b| a.1.cmp(&b.1));
         println!("📅 Files sorted chronologically (oldest → newest)");
     }
     
-    // Process files in order
     for (file, _) in files_with_time {
         println!("  📄 {}", file.path().display());
         
@@ -190,7 +212,7 @@ fn read_all_files_with_sorting(
                 }
                 
                 let filename = file.path().file_name().unwrap().to_str().unwrap().to_string();
-                all_files_content.push((filename, content));
+                all_files_content.push((filename, content, file.path().to_path_buf()));
             }
             Err(e) => println!("Error reading {}: {}", file.path().display(), e),
         }
@@ -220,20 +242,45 @@ fn remove_emojis(content: &str) -> String {
     result
 }
 
-fn compress_all_content(all_files_content: &[(String, String)], args: &Args) -> String {
-    let mut combined_content = String::new();
-    
-    // Add model-specific header
-    combined_content.push_str(&create_model_header(&args.model, args.ai_mode));
-    
-    for (filename, content) in all_files_content {
-        combined_content.push_str(&format!("F:{}\n", filename));
-        let compressed = compress_content(content, &args.level, &args.model, args.ai_mode, args.no_emojis);
-        combined_content.push_str(&compressed);
-        combined_content.push_str("\n|\n");
+fn compress_all_content(all_files_content: &[(String, String, std::path::PathBuf)], args: &Args) -> String {
+    match args.format.as_str() {
+        "vrd" => {
+            // Warn if using VRD format with single file (inefficient due to overhead)
+            if all_files_content.len() == 1 {
+                println!("⚠️  WARNING: VRD format with single file may be less efficient due to format overhead.");
+                println!("   Consider using regular markdown compression (remove --format vrd) for single files.");
+                println!("   VRD format is optimized for multi-file documentation sets.\n");
+            }
+            
+            // Calculate original stats for VRD
+            let original_stats = CompressionStats {
+                original_size: all_files_content.iter().map(|(_, c, _)| c.len()).sum(),
+                compressed_size: 0,
+                original_lines: all_files_content.iter().map(|(_, c, _)| c.lines().count()).sum(),
+                compressed_lines: 0,
+                chunks_created: 0,
+            };
+            generate_vrd_content(all_files_content, args, &original_stats)
+        }
+        "md" => {
+            // Existing markdown generation...
+            let mut combined_content = String::new();
+            combined_content.push_str(&create_model_header(&args.model, args.ai_mode));
+            
+            for (filename, content, _) in all_files_content {
+                combined_content.push_str(&format!("F:{}\n", filename));
+                let compressed = compress_content(content, &args.level, &args.model, args.ai_mode, args.no_emojis);
+                combined_content.push_str(&compressed);
+                combined_content.push_str("\n|\n");
+            }
+            
+            combined_content
+        }
+        _ => {
+            println!("❌ Unsupported format: {}", args.format);
+            std::process::exit(1);
+        }
     }
-    
-    combined_content
 }
 
 fn create_model_header(model: &str, ai_mode: bool) -> String {
@@ -283,7 +330,7 @@ fn create_chunks(content: &str, args: &Args, stats: &mut CompressionStats) {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
     let chunk_size = args.max_lines;
-    let total_chunks = (total_lines + chunk_size - 1) / chunk_size; // Ceiling division
+    let total_chunks = (total_lines + chunk_size - 1) / chunk_size;
     
     println!("📦 Creating {} chunks of ~{} lines each...", total_chunks, chunk_size);
     
@@ -294,32 +341,34 @@ fn create_chunks(content: &str, args: &Args, stats: &mut CompressionStats) {
         
         let mut chunk_content = String::new();
         
-        // Add chunk header
-        chunk_content.push_str(&format!("CHUNK:{}/{}", chunk_num + 1, total_chunks));
-        if chunk_num + 1 < total_chunks {
-            // Smart naming: check if output already contains "chunk"
-            let next_chunk_name = if args.output.contains("chunk") {
-                format!("{}_{}.md", args.output, chunk_num + 2)
-            } else {
-                format!("{}_chunk_{}.md", args.output, chunk_num + 2)
-            };
-            chunk_content.push_str(&format!(" | NEXT:{}", next_chunk_name));
-        }
-        chunk_content.push_str("\n");
-        
-        // Add the actual content
-        chunk_content.push_str(&chunk_lines.join("\n"));
-        
-        // Add chunk footer with metadata
-        chunk_content.push_str(&format!("\n---\nCHUNK_END | Lines:{} | Est.tokens:{}", 
-                                       chunk_lines.len(), 
-                                       chunk_content.len() / 4)); // Rough token estimate
-        
-        // Write chunk file with smart naming
-        let chunk_filename = if args.output.contains("chunk") {
-            format!("{}_{}.md", args.output, chunk_num + 1)
+        // For VRD format, don't add markdown-style chunk headers
+        if args.format == "vrd" {
+            // For VRD, update the header to reflect the chunk number
+            let vrd_content = update_vrd_chunk_header(chunk_lines.join("\n"), chunk_num + 1, total_chunks, args);
+            chunk_content = vrd_content;
         } else {
-            format!("{}_chunk_{}.md", args.output, chunk_num + 1)
+            // Original markdown chunking logic
+            chunk_content.push_str(&format!("CHUNK:{}/{}", chunk_num + 1, total_chunks));
+            if chunk_num + 1 < total_chunks {
+                let next_chunk_name = if args.output.contains("chunk") {
+                    format!("{}_{}.{}", args.output, chunk_num + 2, if args.format == "vrd" { "vrd" } else { "md" })
+                } else {
+                    format!("{}_chunk_{}.{}", args.output, chunk_num + 2, if args.format == "vrd" { "vrd" } else { "md" })
+                };
+                chunk_content.push_str(&format!(" | NEXT:{}", next_chunk_name));
+            }
+            chunk_content.push_str("\n");
+            chunk_content.push_str(&chunk_lines.join("\n"));
+            chunk_content.push_str(&format!("\n---\nCHUNK_END | Lines:{} | Est.tokens:{}", 
+                                           chunk_lines.len(), 
+                                           chunk_content.len() / 4));
+        }
+        
+        // Write chunk file with correct extension
+        let chunk_filename = if args.output.contains("chunk") {
+            format!("{}_{}.{}", args.output, chunk_num + 1, if args.format == "vrd" { "vrd" } else { "md" })
+        } else {
+            format!("{}_chunk_{}.{}", args.output, chunk_num + 1, if args.format == "vrd" { "vrd" } else { "md" })
         };
         
         match fs::write(&chunk_filename, &chunk_content) {
@@ -336,7 +385,12 @@ fn create_chunks(content: &str, args: &Args, stats: &mut CompressionStats) {
 }
 
 fn write_single_file(content: &str, args: &Args, stats: &mut CompressionStats) {
-    let output_filename = format!("{}.md", args.output);
+    let output_filename = if args.format == "vrd" {
+        format!("{}.vrd", args.output)
+    } else {
+        format!("{}.md", args.output)
+    };
+    
     match fs::write(&output_filename, content) {
         Ok(()) => {
             println!("✅ Successfully compressed and wrote to {}", output_filename);
@@ -443,12 +497,12 @@ fn prioritize_code_content(content: &str) -> String {
     content.to_string()
 }
 
-fn remove_duplicate_content(all_files_content: Vec<(String, String)>, show_stats: bool) -> Vec<(String, String)> {
+fn remove_duplicate_content(all_files_content: Vec<(String, String, std::path::PathBuf)>, show_stats: bool) -> Vec<(String, String, std::path::PathBuf)> {
     let mut seen_paragraphs = std::collections::HashSet::new();
     let mut deduplicated = Vec::new();
     let mut duplicates_removed = 0;
     
-    for (filename, content) in all_files_content {
+    for (filename, content, path) in all_files_content {
         let paragraphs: Vec<&str> = content.split('\n').collect();
         let mut unique_paragraphs = Vec::new();
         
@@ -469,7 +523,7 @@ fn remove_duplicate_content(all_files_content: Vec<(String, String)>, show_stats
             }
         }
         
-        deduplicated.push((filename, unique_paragraphs.join("\n")));
+        deduplicated.push((filename, unique_paragraphs.join("\n"), path));
     }
     
     if duplicates_removed > 0 {
@@ -636,4 +690,573 @@ fn print_final_stats(stats: &CompressionStats, show_detailed: bool) {
         println!("   {} lines → {} lines ({:.1}% reduction)", 
                  stats.original_lines, stats.compressed_lines, line_compression_ratio);
     }
+}
+
+
+fn generate_vrd_content(all_files_content: &[(String, String, std::path::PathBuf)], args: &Args, original_stats: &CompressionStats) -> String {
+    let mut vrd_files = Vec::new();
+    
+    // Process each file into VRD format
+    for (filename, content, path) in all_files_content {
+        let vrd_file = process_file_for_vrd(filename, content, args, path);
+        vrd_files.push(vrd_file);
+    }
+    
+    // Build VRD content first to calculate accurate size
+    let vrd_content = build_vrd_output(&vrd_files, args);
+    
+    // Calculate actual compression stats
+    let compressed_size = vrd_content.len();
+    let _compressed_lines = vrd_content.lines().count();
+    
+    // Generate metadata with accurate compression stats
+    let metadata = VrdMetadata {
+        files_count: all_files_content.len(),
+        estimated_tokens: compressed_size / 4,
+        compression_ratio: if original_stats.original_size > 0 {
+            // Positive compression ratio (should be positive when we save space)
+            ((original_stats.original_size as f64 - compressed_size as f64) / original_stats.original_size as f64) * 100.0
+        } else {
+            0.0
+        },
+        generated: Utc::now(),
+    };
+    
+    // Update the content with correct metadata
+    update_vrd_metadata(&vrd_content, &metadata)
+}
+
+fn update_vrd_metadata(content: &str, metadata: &VrdMetadata) -> String {
+    content.replace(
+        "META:{files:0,tokens:0,compressed:0.0%,generated:2025-01-01T00:00:00Z}",
+        &format!(
+            "META:{{files:{},tokens:{},compressed:{:.1}%,generated:{}}}",
+            metadata.files_count,
+            metadata.estimated_tokens,
+            metadata.compression_ratio,
+            metadata.generated.format("%Y-%m-%dT%H:%M:%SZ")
+        )
+    )
+}
+
+fn process_file_for_vrd(filename: &str, content: &str, args: &Args, file_path: &std::path::Path) -> VrdFile {
+    // Get real file modification time
+    let modified_time = if let Ok(metadata) = file_path.metadata() {
+        if let Ok(modified) = metadata.modified() {
+            DateTime::<Utc>::from(modified)
+        } else {
+            Utc::now()
+        }
+    } else {
+        Utc::now()
+    };
+
+    let mut vrd_file = VrdFile {
+        name: filename.to_string(),
+        modified: modified_time, // Use actual file time
+        size: content.len(),
+        lines: content.lines().count(),
+        tags: extract_enhanced_tags_from_content(content),
+        headers: extract_headers_for_vrd(content, args.no_emojis),
+        content: String::new(),
+        code_blocks: Vec::new(),
+    };
+    
+    // Process content through compression pipeline
+    let mut processed_content = content.to_string();
+    
+    if args.no_emojis {
+        processed_content = remove_emojis(&processed_content);
+    }
+    
+    vrd_file.code_blocks = extract_and_compress_code_blocks(&processed_content);
+    processed_content = apply_vrd_compression(&processed_content, &args.level);
+    vrd_file.content = processed_content;
+    vrd_file
+}
+
+fn apply_vrd_compression(content: &str, level: &str) -> String {
+    let mut result = content.to_string();
+    
+    // Remove code blocks (they're handled separately)
+    let re_code_block = regex::Regex::new(r"```[\s\S]*?```").unwrap();
+    result = re_code_block.replace_all(&result, "").to_string();
+    
+    // Remove headers (they're in the H: field) - apply line by line
+    result = result
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    
+    // Apply standard compression
+    result = remove_excessive_whitespace(&result);
+    result = remove_empty_lines(&result);
+    
+    // VRD-specific optimizations
+    result = apply_arrow_notation(&result);
+    result = apply_vrd_abbreviations(&result);
+    result = compress_vrd_lists(&result);
+    result = compress_vrd_sentences(&result);
+    
+    match level {
+        "high" | "extreme" => {
+            result = apply_extreme_vrd_compression(&result);
+            result = apply_mathematical_notation(&result);
+        }
+        _ => {}
+    }
+    
+    result
+}
+
+fn compress_vrd_lists(content: &str) -> String {
+    let mut result = content.to_string();
+    
+    // Convert bullet points to more compact notation
+    let re_bullets = regex::Regex::new(r"^[*-]\s+(.+)$").unwrap();
+    result = re_bullets.replace_all(&result, "•$1").to_string();
+    
+    // Convert numbered lists to compact notation
+    let re_numbered = regex::Regex::new(r"^\d+\.\s+(.+)$").unwrap();
+    result = re_numbered.replace_all(&result, "№$1").to_string();
+    
+    result
+}
+
+fn compress_vrd_sentences(content: &str) -> String {
+    let mut result = content.to_string();
+    
+    // Replace common verbose phrases with concise equivalents
+    let replacements = [
+        (r"in order to", "to"),
+        (r"due to the fact that", "because"),
+        (r"it is important to note that", "NOTE:"),
+        (r"please note that", "NOTE:"),
+        (r"as mentioned above", "↑"),
+        (r"as shown below", "↓"),
+        (r"for example", "EX:"),
+        (r"such as", "e.g."),
+        (r"and so on", "etc"),
+        (r"at this point in time", "now"),
+        (r"in the event that", "if"),
+        (r"on the other hand", "vs"),
+    ];
+    
+    for (pattern, replacement) in replacements {
+        let re = regex::Regex::new(&format!(r"(?i){}", pattern)).unwrap();
+        result = re.replace_all(&result, replacement).to_string();
+    }
+    
+    result
+}
+
+fn extract_headers_for_vrd(content: &str, no_emojis: bool) -> Vec<String> {
+    let mut headers = Vec::new();
+    
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            // Extract header text, removing markdown symbols
+            let mut header_text = trimmed
+                .trim_start_matches('#')
+                .trim()
+                .to_string();
+            
+            // Apply emoji removal if enabled
+            if no_emojis {
+                header_text = remove_emojis(&header_text);
+            }
+            
+            headers.push(header_text);
+        }
+    }
+    
+    headers
+}
+
+fn extract_and_compress_code_blocks(content: &str) -> Vec<String> {
+    let re_code_block = regex::Regex::new(r"```(\w+)?\n([\s\S]*?)```").unwrap();
+    let mut code_blocks = Vec::new();
+    
+    for cap in re_code_block.captures_iter(content) {
+        let lang = cap.get(1).map_or("", |m| m.as_str());
+        let code = cap.get(2).map_or("", |m| m.as_str());
+        
+        // Compress code using arrow notation
+        let compressed_code = compress_code_for_vrd(code, lang);
+        code_blocks.push(compressed_code);
+    }
+    
+    code_blocks
+}
+
+fn compress_code_for_vrd(code: &str, _lang: &str) -> String {
+    // Ultra-aggressive code compression for VRD
+    let compressed = code
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.trim()
+                // Replace common patterns with arrows
+                .replace(" => ", "→")
+                .replace(" -> ", "→")
+                .replace("return ", "→")
+                .replace("async function ", "async FN ")
+                .replace("function ", "FN ")
+                .replace("const ", "")
+                .replace("let ", "")
+                .replace("var ", "")
+                // Remove unnecessary spaces
+                .replace("( ", "(")
+                .replace(" )", ")")
+                .replace("{ ", "{")
+                .replace(" }", "}")
+        })
+        .collect::<Vec<_>>()
+        .join("→");
+    
+    compressed
+}
+
+fn apply_arrow_notation(content: &str) -> String {
+    let mut result = apply_enhanced_arrow_notation(content);
+    
+    let basic_patterns = [
+        (r" then ", "→"),
+        (r" and then ", "→"),
+        (r" which ", "→"),
+        (r" that ", "→"),
+        (r" leads to ", "→"),
+        (r" results in ", "→"),
+        (r" causes ", "→"),
+        (r" triggers ", "→"),
+        (r" followed by ", "→"),
+    ];
+    
+    for (pattern, replacement) in basic_patterns {
+        let re = regex::Regex::new(pattern).unwrap();
+        result = re.replace_all(&result, replacement).to_string();
+    }
+    
+    result
+}
+
+fn apply_vrd_abbreviations(content: &str) -> String {
+    let abbreviations = [
+        ("application", "app"),
+        ("configuration", "CFG"),
+        ("authentication", "AUTH"),
+        ("authorization", "AUTHZ"),
+        ("database", "DB"),
+        ("function", "FN"),
+        ("parameter", "PARAM"),
+        ("variable", "var"),
+        ("interface", "interface"),
+        ("implementation", "IMPL"),
+        ("documentation", "DOC"),
+        ("example", "EX"),
+        ("installation", "INST"),
+        ("development", "dev"),
+        ("production", "prod"),
+        ("environment", "env"),
+        ("repository", "repo"),
+    ];
+    
+    let mut result = content.to_string();
+    for (full, abbrev) in abbreviations {
+        let re = regex::Regex::new(&format!(r"\b{}\b", regex::escape(full))).unwrap();
+        result = re.replace_all(&result, abbrev).to_string();
+    }
+    
+    result
+}
+
+fn apply_extreme_vrd_compression(content: &str) -> String {
+    let mut result = content.to_string();
+    
+    // Remove articles
+    let re_articles = regex::Regex::new(r"\b(a|an|the)\s+").unwrap();
+    result = re_articles.replace_all(&result, "").to_string();
+    
+    // Remove filler words
+    let fillers = ["really", "very", "quite", "just", "simply", "basically", "essentially", "actually", "literally"];
+    for filler in fillers {
+        let re = regex::Regex::new(&format!(r"\b{}\s+", filler)).unwrap();
+        result = re.replace_all(&result, "").to_string();
+    }
+    
+    // Remove redundant markdown formatting since it's already structured
+    result = result.replace("**", "");
+    result = result.replace("*", "");
+    
+    // Compress common phrases aggressively
+    let aggressive_replacements = [
+        ("in order to", "to"),
+        ("due to the fact that", "because"),
+        ("it is important to note that", "NOTE:"),
+        ("please note that", "NOTE:"),
+        ("as mentioned above", "↑"),
+        ("as shown below", "↓"),
+        ("for example", "EX:"),
+        ("such as", "e.g."),
+        ("and so on", "etc"),
+        ("at this point in time", "now"),
+        ("in the event that", "if"),
+        ("on the other hand", "vs"),
+        ("Generated:", "Gen:"),
+        ("Created:", "Made:"),
+        ("Implemented:", "Built:"),
+        ("Achievement:", "Win:"),
+        ("Accomplished:", "Done:"),
+        ("Features", "F:"),
+        ("Priority", "P"),
+        ("Current", "Now"),
+        ("Strategic", "Strategy"),
+        ("Technical", "Tech"),
+        ("Development", "Dev"),
+        ("Implementation", "Impl"),
+        ("Optimization", "Opt"),
+        ("Specification", "Spec"),
+        ("Documentation", "Doc"),
+        ("Repository", "Repo"),
+        ("Application", "App"),
+        ("Configuration", "Config"),
+        ("Environment", "Env"),
+        ("Performance", "Perf"),
+        ("Quality Assurance", "QA"),
+        ("User Experience", "UX"),
+        ("Breakthrough", "Win"),
+        ("represents", "="),
+        ("demonstrates", "shows"),
+        ("successfully", "✓"),
+        ("efficiently", "fast"),
+        ("comprehensive", "full"),
+        ("innovative", "new"),
+        ("revolutionary", "new"),
+        ("significant", "big"),
+        ("important", "key"),
+        ("potential", "could"),
+        ("capability", "can"),
+        ("functionality", "work"),
+        ("opportunity", "chance"),
+        ("improvement", "fix"),
+        ("enhancement", "boost"),
+    ];
+    
+    for (full, short) in aggressive_replacements {
+        let re = regex::Regex::new(&format!(r"(?i)\b{}\b", regex::escape(full))).unwrap();
+        result = re.replace_all(&result, short).to_string();
+    }
+    
+    result
+}
+
+fn apply_mathematical_notation(content: &str) -> String {
+    let mut result = content.to_string();
+    
+    let math_replacements = [
+        (r"\breturn\b", "→"),
+        (r"\byield\b", "⟶"),
+        (r"\btherefore\b", "∴"),
+        (r"\bbecause\b", "∵"),
+        (r"\bequals?\b", "="),
+        (r"\bnot equal", "≠"),
+        (r"\bgreater than or equal", "≥"),
+        (r"\bless than or equal", "≤"),
+        (r"\bapproximately", "≈"),
+        (r"\binfinity", "∞"),
+        (r"\bsum of", "Σ"),
+        (r"\bfor all", "∀"),
+        (r"\bthere exists", "∃"),
+        (r"\bmapping to", "↦"),
+        (r"\bimplies", "⟹"),
+        (r"\bif and only if", "⟺"),
+    ];
+    
+    for (pattern, replacement) in math_replacements {
+        let re = regex::Regex::new(&format!(r"(?i){}", pattern)).unwrap();
+        result = re.replace_all(&result, replacement).to_string();
+    }
+    
+    result
+}
+
+fn apply_enhanced_arrow_notation(content: &str) -> String {
+    let patterns = [
+        // Process flows
+        (r"user submits form", "user→form"),
+        (r"server validates data", "server→validate"),
+        (r"database stores result", "DB→store"),
+        (r"system sends response", "system→response"),
+        
+        // Causal relationships
+        (r"(\w+)\s+triggers\s+(\w+)", "$1→$2"),
+        (r"(\w+)\s+causes\s+(\w+)", "$1→$2"),
+        (r"(\w+)\s+leads to\s+(\w+)", "$1→$2"),
+        (r"(\w+)\s+results in\s+(\w+)", "$1→$2"),
+        
+        // Temporal sequences
+        (r"after\s+(\w+),?\s+(\w+)", "$1→$2"),
+        (r"once\s+(\w+),?\s+(\w+)", "$1→$2"),
+        (r"when\s+(\w+),?\s+(\w+)", "$1→$2"),
+        (r"then\s+(\w+)", "→$1"),
+        
+        // Data flows
+        (r"(\w+)\s+passes\s+(\w+)\s+to\s+(\w+)", "$1→$2→$3"),
+        (r"(\w+)\s+sends\s+(\w+)", "$1→$2"),
+        (r"(\w+)\s+receives\s+(\w+)", "$2→$1"),
+    ];
+    
+    let mut result = content.to_string();
+    for (pattern, replacement) in patterns {
+        let re = regex::Regex::new(&format!(r"(?i){}", pattern)).unwrap();
+        result = re.replace_all(&result, replacement).to_string();
+    }
+    
+    result
+}
+
+fn update_vrd_chunk_header(content: String, chunk_num: usize, total_chunks: usize, args: &Args) -> String {
+    // Replace the CHUNKS field in the VRD header
+    let updated = content.replace(
+        "CHUNKS:1/1",
+        &format!("CHUNKS:{}/{}", chunk_num, total_chunks)
+    );
+    
+    // Add NEXT reference if not the last chunk
+    if chunk_num < total_chunks {
+        let next_filename = if args.output.contains("chunk") {
+            format!("{}_{}.vrd", args.output, chunk_num + 1)
+        } else {
+            format!("{}_chunk_{}.vrd", args.output, chunk_num + 1)
+        };
+        
+        // Insert NEXT after CHUNKS
+        updated.replace(
+            &format!("CHUNKS:{}/{}", chunk_num, total_chunks),
+            &format!("CHUNKS:{}/{}|NEXT:{}", chunk_num, total_chunks, next_filename)
+        )
+    } else {
+        updated
+    }
+}
+
+fn build_vrd_output(vrd_files: &[VrdFile], args: &Args) -> String {
+    let mut output = String::new();
+    
+    // Header (metadata will be updated later)
+    output.push_str(&format!(
+        "VRD1.0|TARGET:{}|MODE:{}|CHUNKS:1/1\n",
+        args.model.to_uppercase(),
+        args.level.to_uppercase()
+    ));
+    
+    // Placeholder metadata (will be updated)
+    output.push_str("META:{files:0,tokens:0,compressed:0.0%,generated:2025-01-01T00:00:00Z}\n");
+    
+    // Dictionary
+    output.push_str("DICT:{");
+    let dict_entries = [
+        ("FN", "function"),
+        ("PARAM", "parameter"),
+        ("AUTH", "authentication"),
+        ("DB", "database"),
+        ("API", "application programming interface"),
+        ("CFG", "configuration"),
+        ("DOC", "documentation"),
+        ("IMPL", "implementation"),
+        ("ENV", "environment"),
+        ("REPO", "repository"),
+    ];
+    
+    for (i, (abbrev, full)) in dict_entries.iter().enumerate() {
+        if i > 0 { output.push(','); }
+        output.push_str(&format!("{}={}", abbrev, full));
+    }
+    output.push_str("}\n---\n");
+    
+    // File contents
+    for (i, file) in vrd_files.iter().enumerate() {
+        if i > 0 { output.push('\n'); }
+        
+        // File header
+        output.push_str(&format!(
+            "F:{}|D:{}|S:{}|L:{}|T:{}\n",
+            file.name,
+            file.modified.format("%Y-%m-%dT%H:%M:%SZ"),
+            file.size,
+            file.lines,
+            file.tags.join(",")
+        ));
+        
+        // Headers
+        if !file.headers.is_empty() {
+            output.push_str(&format!("H:{}\n", file.headers.join(",")));
+        }
+        
+        // Content
+        if !file.content.trim().is_empty() {
+            output.push_str(&format!("C:{}\n", file.content.trim()));
+        }
+        
+        // Code blocks
+        for code_block in &file.code_blocks {
+            output.push_str(&format!("X:{}\n", code_block));
+        }
+        
+        output.push_str("|\n");
+    }
+    
+    output
+}
+
+fn extract_enhanced_tags_from_content(content: &str) -> Vec<String> {
+    let mut tags = std::collections::HashSet::new();
+    let content_lower = content.to_lowercase();
+    
+    // Technical framework tags
+    let frameworks = [
+        ("react", "react"), ("vue", "vue"), ("angular", "angular"),
+        ("express", "express"), ("fastapi", "fastapi"), ("django", "django"),
+        ("flask", "flask"), ("spring", "spring"), ("rails", "rails"),
+        ("nextjs", "nextjs"), // Added to make 10 elements
+    ];
+    
+    // Language tags
+    let languages = [
+        ("javascript", "js"), ("typescript", "ts"), ("python", "python"),
+        ("rust", "rust"), ("go", "go"), ("java", "java"), ("c++", "cpp"),
+        ("c#", "csharp"), ("php", "php"), ("ruby", "ruby"),
+    ];
+    
+    // Technology tags
+    let technologies = [
+        ("docker", "docker"), ("kubernetes", "k8s"), ("aws", "aws"),
+        ("azure", "azure"), ("gcp", "gcp"), ("redis", "redis"),
+        ("postgresql", "postgres"), ("mysql", "mysql"), ("mongodb", "mongo"),
+        ("elasticsearch", "elastic"),
+    ];
+    
+    // Concept tags
+    let concepts = [
+        ("authentication", "auth"), ("authorization", "authz"),
+        ("security", "security"), ("testing", "testing"), ("deployment", "deploy"),
+        ("monitoring", "monitoring"), ("logging", "logging"), ("caching", "cache"),
+        ("scaling", "scale"), ("performance", "perf"),
+    ];
+    
+    let all_patterns = [frameworks, languages, technologies, concepts].concat();
+    
+    for (pattern, tag) in all_patterns {
+        if content_lower.contains(pattern) {
+            tags.insert(tag.to_string());
+        }
+    }
+    
+    // Convert to sorted vector, limit to 5 most relevant
+    let mut tag_vec: Vec<String> = tags.into_iter().collect();
+    tag_vec.sort();
+    tag_vec.truncate(5);
+    tag_vec
 }
