@@ -41,3 +41,5 @@ test.*
 # Temporary files
 *.tmp
 *.temp
+
+test_docs/

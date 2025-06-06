@@ -799,6 +799,11 @@ fn apply_vrd_compression(content: &str, level: &str) -> String {
     result = compress_vrd_lists(&result);
     result = compress_vrd_sentences(&result);
     
+    // NEW v2.3.1 optimizations for improved compression
+    result = optimize_checkboxes(&result);
+    result = optimize_emphasis(&result);
+    // Note: optimize_code_blocks is handled separately in extract_and_compress_code_blocks
+    
     match level {
         "high" | "extreme" => {
             result = apply_extreme_vrd_compression(&result);
@@ -876,16 +881,26 @@ fn extract_headers_for_vrd(content: &str, no_emojis: bool) -> Vec<String> {
 }
 
 fn extract_and_compress_code_blocks(content: &str) -> Vec<String> {
+    // First apply the new code block optimization
+    let optimized_content = optimize_code_blocks(content);
+    
     let re_code_block = regex::Regex::new(r"```(\w+)?\n([\s\S]*?)```").unwrap();
     let mut code_blocks = Vec::new();
     
-    for cap in re_code_block.captures_iter(content) {
+    for cap in re_code_block.captures_iter(&optimized_content) {
         let lang = cap.get(1).map_or("", |m| m.as_str());
         let code = cap.get(2).map_or("", |m| m.as_str());
         
         // Compress code using arrow notation
         let compressed_code = compress_code_for_vrd(code, lang);
         code_blocks.push(compressed_code);
+    }
+    
+    // Also handle the new compact formats we created
+    let re_compact_code = regex::Regex::new(r"CODE\(([^)]+)\)→([^→]+)→CODE\(/[^)]+\)").unwrap();
+    for cap in re_compact_code.captures_iter(&optimized_content) {
+        let compressed = cap.get(0).map_or("", |m| m.as_str()).to_string();
+        code_blocks.push(compressed);
     }
     
     code_blocks
@@ -1259,4 +1274,78 @@ fn extract_enhanced_tags_from_content(content: &str) -> Vec<String> {
     tag_vec.sort();
     tag_vec.truncate(5);
     tag_vec
+}
+
+fn optimize_checkboxes(content: &str) -> String {
+    let mut result = content.to_string();
+    
+    // Optimize checked and unchecked boxes
+    let re_unchecked = Regex::new(r"- \[ \]").unwrap();
+    let re_checked = Regex::new(r"- \[x\]").unwrap();
+    let re_checked_upper = Regex::new(r"- \[X\]").unwrap();
+    
+    result = re_unchecked.replace_all(&result, "☐").to_string();
+    result = re_checked.replace_all(&result, "☑").to_string();
+    result = re_checked_upper.replace_all(&result, "☑").to_string();
+    
+    result
+}
+
+fn optimize_emphasis(content: &str) -> String {
+    let mut result = content.to_string();
+    
+    // Convert **bold** to *bold* (saves 2 chars per occurrence)
+    let re_bold = Regex::new(r"\*\*([^*]+?)\*\*").unwrap();
+    result = re_bold.replace_all(&result, "*$1*").to_string();
+    
+    // Keep single asterisk emphasis as-is since it's already optimal
+    
+    result
+}
+
+fn optimize_code_blocks(content: &str) -> String {
+    let mut result = content.to_string();
+    
+    // Optimize multi-line code blocks with language specification
+    let re_code_with_lang = Regex::new(r"```(\w+)\n([\s\S]*?)```").unwrap();
+    result = re_code_with_lang.replace_all(&result, |caps: &regex::Captures| {
+        let lang = caps.get(1).map_or("", |m| m.as_str());
+        let code = caps.get(2).map_or("", |m| m.as_str());
+        
+        // Compress code lines and use compact format
+        let compressed_lines: Vec<&str> = code
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        
+        if compressed_lines.len() <= 1 {
+            // Single line: use inline format
+            format!("CODE({}): {}", lang.to_uppercase(), compressed_lines.join(""))
+        } else {
+            // Multiple lines: use compact block format
+            format!("CODE({})→{}→CODE(/{}) ", 
+                   lang.to_uppercase(), 
+                   compressed_lines.join("→"), 
+                   lang.to_uppercase())
+        }
+    }).to_string();
+    
+    // Optimize code blocks without language specification
+    let re_code_no_lang = Regex::new(r"```\n([\s\S]*?)```").unwrap();
+    result = re_code_no_lang.replace_all(&result, |caps: &regex::Captures| {
+        let code = caps.get(1).map_or("", |m| m.as_str());
+        
+        let compressed_lines: Vec<&str> = code
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        
+        if compressed_lines.len() <= 1 {
+            format!("CODE: {}", compressed_lines.join(""))
+        } else {
+            format!("CODE→{}→/CODE", compressed_lines.join("→"))
+        }
+    }).to_string();
+    
+    result
 }
